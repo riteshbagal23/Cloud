@@ -23,7 +23,7 @@ CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 EOF
 
 # 5. Start the server
-python -m uvicorn server:app --reload --port 8000 --host 127.0.0.1
+python -m uvicorn server:app --reload --port 8000 --host 0.0.0.0
 ```
 
 ### Step 2: Frontend Setup (3 minutes)
@@ -39,6 +39,7 @@ yarn install
 # OR: npm install
 
 # 3. Create .env file (optional, defaults to http://localhost:8000)
+# For AWS deployment: echo "REACT_APP_BACKEND_URL=http://13.233.151.151:8000" > .env
 echo "REACT_APP_BACKEND_URL=http://localhost:8000" > .env
 
 # 4. Start the frontend

@@ -119,6 +119,11 @@ CACHE_TTL = 1800  # 30 minutes - longer cache for better performance
 LAST_CACHE_CLEANUP = 0  # Track last cleanup time
 CACHE_CLEANUP_INTERVAL = 300  # Clean cache every 5 minutes (not on every request)
 
+# In-memory small state to track last scale time per ASG to enforce cooldowns.
+# This is intentionally simple; for multiple-process deployments consider a
+# shared store (Redis/DB) to coordinate cooldown across instances.
+SCALE_STATE = {}
+
 # Cache for calendar/festival API calls (TTL: 24 hours - festivals don't change)
 FESTIVAL_CACHE = {}
 FESTIVAL_CACHE_TTL = 86400  # 24 hours
@@ -553,10 +558,14 @@ def check_festival_calendarific(date_str: str, country: str = 'IN') -> Dict[str,
 
 def get_aws_autoscaling_client():
     """Get AWS Auto Scaling client"""
+    # Prefer IAM role credentials (EC2 instance profile). If explicit keys are provided
+    # in the environment we will use them; otherwise boto3 will automatically pick up
+    # the instance role credentials when running on EC2. Returning a client (not None)
+    # allows real scaling to proceed when running on an instance with an attached role.
     aws_access_key = os.environ.get('AWS_ACCESS_KEY_ID', '')
     aws_secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
     aws_region = os.environ.get('AWS_REGION', 'us-east-1')
-    
+
     if aws_access_key and aws_secret_key:
         return boto3.client(
             'autoscaling',
@@ -564,7 +573,13 @@ def get_aws_autoscaling_client():
             aws_secret_access_key=aws_secret_key,
             region_name=aws_region
         )
-    return None
+
+    # No explicit keys: rely on IAM role / default session
+    try:
+        return boto3.client('autoscaling', region_name=aws_region)
+    except Exception as e:
+        logger.warning(f"Could not create boto3 autoscaling client: {e}")
+        return None
 
 def scale_ec2_instances(predicted_load: float, asg_name: str) -> Dict[str, Any]:
     """Scale EC2 Auto Scaling Group based on predicted load
@@ -579,48 +594,114 @@ def scale_ec2_instances(predicted_load: float, asg_name: str) -> Dict[str, Any]:
     """
     try:
         client = get_aws_autoscaling_client()
-        
-        # Calculate required instances based on traffic load
-        desired = calculate_recommended_instances(predicted_load)
+
+        # Calculate recommended instances based on traffic load
+        recommended = calculate_recommended_instances(predicted_load)
+
+        # Configurable safeguards (environment variables)
+        max_increment = int(os.environ.get('MAX_SCALE_INCREMENT', '2'))  # max new instances per call
+        hard_cap = int(os.environ.get('HARD_MAX_CAP', '2'))  # absolute maximum instances allowed
+        cooldown_seconds = int(os.environ.get('SCALE_COOLDOWN_SECONDS', '300'))
+
+        # fallback max_size mapping for backward compatibility
         max_size_map = {1: 2, 2: 3, 3: 5, 4: 6, 5: 8, 10: 15}
-        max_size = max_size_map.get(desired, 15)
-        
+        max_size = max_size_map.get(recommended, max(hard_cap, 15))
+
         if not client:
-            # Mock mode
-            logger.info(f"[MOCK] AWS credentials not provided")
-            
+            # Mock mode (no AWS credentials or client creation failed)
+            logger.info("[MOCK] AWS autoscaling client not available; running in mock mode")
+            desired = min(recommended, hard_cap)
             return {
                 'success': True,
                 'mode': 'mock',
                 'predicted_load': predicted_load,
+                'recommended_capacity': recommended,
                 'desired_capacity': desired,
                 'max_size': max_size,
                 'message': f'[MOCK] Would scale to {desired} instances for load {predicted_load:.0f}',
-                'scaling_logic': f'Traffic: {predicted_load:.0f} → {desired} instances'
             }
-        
-        # Real AWS scaling
-        
-        response = client.set_desired_capacity(
+
+        # Describe ASG to get current desired and instance counts
+        resp = client.describe_auto_scaling_groups(AutoScalingGroupNames=[asg_name])
+        groups = resp.get('AutoScalingGroups', [])
+        if not groups:
+            raise ClientError({'Error': {'Message': f'ASG {asg_name} not found'}}, 'DescribeAutoScalingGroups')
+
+        group = groups[0]
+        current_desired = int(group.get('DesiredCapacity', 0))
+        in_service = sum(1 for i in group.get('Instances', []) if i.get('LifecycleState') == 'InService')
+        min_size = int(group.get('MinSize', 1))
+        current_max = int(group.get('MaxSize', max_size))
+
+        # Enforce hard cap
+        effective_hard_cap = min(hard_cap, current_max)
+
+        # Respect cooldown: simple in-memory guard (per ASG)
+        now = datetime.now().timestamp()
+        last_scale = SCALE_STATE.get(asg_name, {}).get('last_scale_time', 0)
+        if now - last_scale < cooldown_seconds:
+            logger.info(f"Scale request for {asg_name} within cooldown ({now-last_scale:.0f}s); skipping scale")
+            return {
+                'success': True,
+                'mode': 'throttled',
+                'predicted_load': predicted_load,
+                'recommended_capacity': recommended,
+                'current_desired': current_desired,
+                'in_service': in_service,
+                'message': f'Scale request skipped due to cooldown ({int(now-last_scale)}s elapsed)'
+            }
+
+        # Compute desired safely: do not exceed hard cap and only increment by max_increment
+        if recommended > current_desired:
+            # scale up but limit jump
+            desired = min(recommended, current_desired + max_increment, effective_hard_cap)
+        else:
+            # allow scale down to recommended (but not below min_size)
+            desired = max(recommended, min_size)
+
+        # If desired equals current_desired, nothing to do
+        if desired == current_desired:
+            logger.info(f"No scaling action required for {asg_name} (current: {current_desired}, desired: {desired})")
+            return {
+                'success': True,
+                'mode': 'noop',
+                'predicted_load': predicted_load,
+                'recommended_capacity': recommended,
+                'current_desired': current_desired,
+                'desired_capacity': desired,
+                'message': 'No scaling change required'
+            }
+
+        # Apply desired capacity change (honor cooldown)
+        logger.info(f"Scaling ASG {asg_name}: current={current_desired}, in_service={in_service}, recommended={recommended}, desired={desired}, hard_cap={effective_hard_cap}")
+        client.set_desired_capacity(
             AutoScalingGroupName=asg_name,
-            DesiredCapacity=desired,
+            DesiredCapacity=int(desired),
             HonorCooldown=True
         )
-        
-        # Update max size if needed
-        client.update_auto_scaling_group(
-            AutoScalingGroupName=asg_name,
-            MaxSize=max_size
-        )
-        
+
+        # Ensure MaxSize not below desired and not above effective_hard_cap
+        new_max = max(current_max, desired)
+        new_max = min(new_max, effective_hard_cap)
+        if new_max != current_max:
+            client.update_auto_scaling_group(
+                AutoScalingGroupName=asg_name,
+                MaxSize=int(new_max)
+            )
+
+        # Record last scale time
+        SCALE_STATE.setdefault(asg_name, {})['last_scale_time'] = now
+
         return {
             'success': True,
             'mode': 'real',
             'predicted_load': predicted_load,
-            'desired_capacity': desired,
-            'max_size': max_size,
+            'recommended_capacity': recommended,
+            'current_desired': current_desired,
+            'desired_capacity': int(desired),
+            'max_size': int(new_max),
             'asg_name': asg_name,
-            'message': f'Scaled {asg_name} to {desired} instances'
+            'message': f'Scaled {asg_name} to {int(desired)} instances'
         }
         
     except (ClientError, NoCredentialsError) as e:
@@ -987,7 +1068,7 @@ class PredictionResponse(BaseModel):
 
 class ScalingRequest(BaseModel):
     predicted_load: float
-    asg_name: str = 'my-asg'
+    asg_name: str = os.environ.get('AWS_ASG_NAME', 'my-asg')
 
 class StatusCheck(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -2052,7 +2133,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', 'http://localhost:3000,http://127.0.0.1:3000,http://ec2-15-207-98-239.ap-south-1.compute.amazonaws.com,http://15.207.98.239.com').split(','),
+    allow_origins=["*"],  # Allow all origins (for development only)
     allow_methods=["*"],
     allow_headers=["*"],
 )
